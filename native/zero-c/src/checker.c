@@ -246,6 +246,20 @@ static bool value_provenance_add_all_as_with_prefix(ValueProvenance *out, const 
   return added;
 }
 
+static bool value_provenance_add_all_as_with_origin_suffix(ValueProvenance *out, const ValueProvenance *source, bool mut_borrow, const char *value_prefix, const char *origin_suffix) {
+  bool added = false;
+  if (!out || !source) return false;
+  for (size_t i = 0; i < source->len; i++) {
+    ProvenanceEntry *entry = &source->items[i];
+    char *value_path = origin_path_join(value_prefix, entry->value_path);
+    char *origin_path = origin_path_join(entry->origin.path, origin_suffix);
+    if (value_provenance_add_full(out, entry->origin.root, entry->origin.root_scope, mut_borrow, entry->local_storage, value_path, origin_path)) added = true;
+    free(value_path);
+    free(origin_path);
+  }
+  return added;
+}
+
 static bool value_provenance_add_all_under_path(ValueProvenance *out, const ValueProvenance *source, const char *path_prefix) {
   bool added = false;
   if (!out || !source) return false;
@@ -5007,10 +5021,16 @@ static bool call_result_value_provenance(const Program *program, const Expr *exp
       ValueProvenance actual_origins = {0};
       if (expr_reference_provenance_as(program, actual, scope, &actual_origins, summary_entry->mutable_borrow)) {
         ValueProvenance selected_origins = {0};
+        char *param_type = checked_call_param_type(program, callee, expr, scope, return_type, param_index);
+        bool reference_param = type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref");
+        free(param_type);
         ValueProvenance *source_origins = &actual_origins;
         if (summary_entry->origin.path) {
           if (value_provenance_add_all_under_path(&selected_origins, &actual_origins, summary_entry->origin.path)) {
             source_origins = &selected_origins;
+          } else if (reference_param) {
+            if (value_provenance_add_all_as_with_origin_suffix(origins, &actual_origins, summary_entry->mutable_borrow, summary_entry->value_path, summary_entry->origin.path)) added = true;
+            source_origins = NULL;
           } else {
             source_origins = NULL;
           }
@@ -5272,15 +5292,21 @@ static bool collect_return_value_provenance_from_stmt_vec(const Program *program
         else_possible = !stmt->expr->bool_value;
       }
       ProvenanceScopeSnapshot *before = provenance_scope_snapshot_capture(scope);
-      Scope then_scope = {.parent = scope};
-      if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->then_body, &then_scope, bindings, binding_len, out)) added = true;
-      scope_free(&then_scope);
-      ProvenanceScopeSnapshot *then_after = provenance_scope_snapshot_capture(scope);
+      ProvenanceScopeSnapshot *then_after = NULL;
+      ProvenanceScopeSnapshot *else_after = NULL;
+      if (then_possible) {
+        Scope then_scope = {.parent = scope};
+        if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->then_body, &then_scope, bindings, binding_len, out)) added = true;
+        scope_free(&then_scope);
+        then_after = provenance_scope_snapshot_capture(scope);
+      }
       provenance_scope_snapshot_restore(before);
-      Scope else_scope = {.parent = scope};
-      if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->else_body, &else_scope, bindings, binding_len, out)) added = true;
-      scope_free(&else_scope);
-      ProvenanceScopeSnapshot *else_after = provenance_scope_snapshot_capture(scope);
+      if (else_possible) {
+        Scope else_scope = {.parent = scope};
+        if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->else_body, &else_scope, bindings, binding_len, out)) added = true;
+        scope_free(&else_scope);
+        else_after = provenance_scope_snapshot_capture(scope);
+      }
       ProvenanceScopeSnapshot *states[] = {then_after, else_after};
       bool continues[] = {
         then_possible && !stmt_vec_guarantees_exit(&stmt->then_body, fun->raises),
@@ -5294,11 +5320,14 @@ static bool collect_return_value_provenance_from_stmt_vec(const Program *program
     }
     if (stmt->kind == STMT_WHILE) {
       ProvenanceScopeSnapshot *before = provenance_scope_snapshot_capture(scope);
-      Scope body_scope = {.parent = scope};
-      if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->then_body, &body_scope, bindings, binding_len, out)) added = true;
-      scope_free(&body_scope);
-      ProvenanceScopeSnapshot *body_after = provenance_scope_snapshot_capture(scope);
       bool body_possible = !(stmt->expr && stmt->expr->kind == EXPR_BOOL && !stmt->expr->bool_value);
+      ProvenanceScopeSnapshot *body_after = NULL;
+      if (body_possible) {
+        Scope body_scope = {.parent = scope};
+        if (collect_return_value_provenance_from_stmt_vec(program, fun, &stmt->then_body, &body_scope, bindings, binding_len, out)) added = true;
+        scope_free(&body_scope);
+        body_after = provenance_scope_snapshot_capture(scope);
+      }
       ProvenanceScopeSnapshot *states[] = {before, body_after};
       bool continues[] = {true, body_possible && !stmt_vec_guarantees_exit(&stmt->then_body, fun->raises)};
       provenance_scope_snapshot_restore_union(before, states, continues, 2);
